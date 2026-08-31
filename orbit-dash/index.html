@@ -848,9 +848,14 @@
     last = now;
     update(dt);
     draw();
-    requestAnimationFrame(frame);
   }
-  requestAnimationFrame(frame);
+  if (new URLSearchParams(location.search).has("test")) {
+    // test mode: keep simulating even when the tab is hidden (rAF throttles)
+    setInterval(() => frame(performance.now()), 16);
+  } else {
+    const loop = now => { frame(now); requestAnimationFrame(loop); };
+    requestAnimationFrame(loop);
+  }
 })();
 </script>
 </body>
