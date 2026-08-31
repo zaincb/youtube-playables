@@ -338,11 +338,26 @@
     burst(shipX(), shipY(), 6, "#ffd166", 90);
   }
 
+  // Hopping from the outer ring wraps to the inner one, crossing the middle
+  // ring radially — make sure that crossing lane is clear for the transit.
+  function wrapTransitSafe() {
+    if (ship.ring !== 2) return true;
+    const collAng = ((AST_R() + SHIP_R()) / ringRadius(1)) * 1.6;
+    for (const ast of asteroids) {
+      if (ast.ring !== 1) continue;
+      for (let tt = 0; tt <= 0.3; tt += 0.05) {
+        if (Math.abs(angDiff(ast.a + ast.sp * tt, ship.a + speed * tt)) < collAng) return false;
+      }
+    }
+    return true;
+  }
+
   function autopilot(dt) {
     autoCooldown -= dt;
     if (autoCooldown > 0) return;
     const dCur = ringDangerTime(ship.ring);
     if (dCur >= 0.65) return;                                  // safe enough, stay put
+    if (!wrapTransitSafe()) { autoCooldown = 0.08; return; }   // can't hop through traffic
     const dNext = ringDangerTime((ship.ring + 1) % RINGS);
     const dNext2 = ringDangerTime((ship.ring + 2) % RINGS);
     // single hop: the next ring must survive the transit (~0.3s) and beat staying
@@ -434,6 +449,18 @@
       const hitDist = ast.r + SHIP_R() * 0.9;
 
       if (ast.born >= 1 && dist < hitDist && invuln <= 0) {
+        if (autoLeft > 0) {
+          // autopilot absorbs the hit, burning 3s of its remaining time
+          autoLeft = Math.max(0, autoLeft - 3);
+          invuln = 0.8;
+          asteroids.splice(i, 1);
+          shake = 0.35;
+          sfx.shield();
+          burst(ax, ay, 16, "#ffd166", 170);
+          popup(sx, sy - 20, "-3s AUTO", "#ffd166");
+          if (autoLeft <= 0) popup(sx, sy - 44, "AUTO OFF", "#ffd166");
+          continue;
+        }
         if (shieldLeft > 0) {
           // shield absorbs the hit and vaporizes the asteroid
           shieldLeft--;
