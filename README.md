@@ -22,6 +22,14 @@ A one-tap idle stacking game. Drop sliding blocks to build the tallest tower —
 - **Controls:** tap / click / spacebar
 - **Tech:** vanilla JavaScript + Canvas, single self-contained HTML file, zero dependencies
 
+### Nova Merge
+
+A swipe-to-merge space puzzle (2048-style). Slide the board to fuse matching celestial bodies — comets into moons, planets into stars, all the way up to galaxies. Merges earn nova points to spend on upgrades: luckier spawns, undos, richer payouts, and comets that keep earning even while you're away (offline earnings included).
+
+- **Play:** https://zaincb.github.io/youtube-playables/nova-merge/
+- **Controls:** swipe / arrow keys (Z = undo)
+- **Tech:** vanilla JavaScript + Canvas, single self-contained HTML file, zero dependencies
+
 ## Running locally
 
 Open any game's `index.html` in a browser, or serve the repo root:

@@ -1,0 +1,778 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Nova Merge</title>
+<meta name="description" content="Nova Merge — a swipe-to-merge space puzzle. Fuse comets into moons, planets, stars, and galaxies. Earn nova points and upgrade your run.">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    overflow: hidden;
+    background: #080714;
+    touch-action: none;
+    -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(() => {
+  "use strict";
+
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+
+  let W = 0, H = 0, DPR = 1, CX = 0, UNIT = 0;
+
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W * DPR;
+    canvas.height = H * DPR;
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    CX = W / 2;
+    UNIT = Math.min(W, H);
+  }
+  window.addEventListener("resize", resize);
+  resize();
+
+  // ---------- Config ----------
+  const N = 4;
+  const TIERS = ["✨","☄️","🌑","🌕","🌍","🪐","☀️","🌟","💫","🌌","🕳️","🌠"];
+  const tierOf = v => Math.min(TIERS.length - 1, Math.round(Math.log2(v)) - 1);
+  const ANIM_T = 0.13;
+
+  function boardSize() { return Math.min(W * 0.94, H * 0.46, UNIT * 0.94); }
+  function boardX() { return CX - boardSize() / 2; }
+  function boardY() { return H * 0.155; }
+  function cellGap() { return boardSize() * 0.025; }
+  function cellSize() { return (boardSize() - cellGap() * (N + 1)) / N; }
+  function cellPos(r, c) {
+    const g = cellGap(), s = cellSize();
+    return { x: boardX() + g + c * (s + g), y: boardY() + g + r * (s + g) };
+  }
+
+  // ---------- Idle economy ----------
+  const COMET_RATE = 2;
+  const OFFLINE_CAP_MIN = 240;
+  const UPGRADES = {
+    start: { icon: "🎲", name: "START", max: 5,  cost: l => Math.floor(60 * Math.pow(2.3, l)),  desc: l => `better spawns +${l * 8}%` },
+    undo:  { icon: "↩️", name: "UNDO",  max: 3,  cost: l => Math.floor(100 * Math.pow(2.5, l)), desc: l => `${l} undo${l === 1 ? "" : "s"} per run` },
+    gold:  { icon: "💰", name: "GOLD",  max: 10, cost: l => Math.floor(50 * Math.pow(2, l)),    desc: l => `points ×${(1 + 0.25 * l).toFixed(2)}` },
+    comet: { icon: "☄️", name: "COMET", max: 8,  cost: l => Math.floor(80 * Math.pow(2.5, l)),  desc: l => `+${l * COMET_RATE}✦/min` }
+  };
+  const goldFactor = () => 1 + 0.25 * save.gold;
+
+  // ---------- Save ----------
+  let save = { best: 0, pts: 0, start: 0, undo: 0, gold: 0, comet: 0, muted: false, last: Date.now() };
+  let offlineEarned = 0, offlineToast = 0;
+  try {
+    const raw = localStorage.getItem("novamerge_save");
+    if (raw) save = Object.assign(save, JSON.parse(raw));
+  } catch (e) {}
+  if (save.comet > 0 && save.last) {
+    const mins = Math.min(Math.max(0, (Date.now() - save.last) / 60000), OFFLINE_CAP_MIN);
+    offlineEarned = Math.floor(mins * COMET_RATE * save.comet);
+    if (offlineEarned > 0) { save.pts += offlineEarned; offlineToast = 6; }
+  }
+  function persist() {
+    save.last = Date.now();
+    try { localStorage.setItem("novamerge_save", JSON.stringify(Object.assign({}, save, { pts: Math.floor(save.pts) }))); } catch (e) {}
+  }
+  persist();
+  document.addEventListener("visibilitychange", () => { if (document.hidden) persist(); });
+  setInterval(persist, 5000);
+
+  // ---------- Sound ----------
+  const AC = window.AudioContext || window.webkitAudioContext;
+  let audio = null;
+  function ensureAudio() {
+    if (!AC) return;
+    if (!audio) { try { audio = new AC(); } catch (e) { return; } }
+    if (audio.state === "suspended") audio.resume();
+  }
+  function tone(freq, dur, type, vol, slideTo) {
+    if (!audio || save.muted) return;
+    const t = audio.currentTime;
+    const o = audio.createOscillator();
+    const g = audio.createGain();
+    o.type = type || "sine";
+    o.frequency.setValueAtTime(freq, t);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t + dur);
+    g.gain.setValueAtTime(vol || 0.15, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g).connect(audio.destination);
+    o.start(t);
+    o.stop(t + dur + 0.02);
+  }
+  function noiseBurst(dur, vol, filterFreq) {
+    if (!audio || save.muted) return;
+    const t = audio.currentTime;
+    const len = Math.floor(audio.sampleRate * dur);
+    const buf = audio.createBuffer(1, len, audio.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len);
+    const src = audio.createBufferSource();
+    src.buffer = buf;
+    const f = audio.createBiquadFilter();
+    f.type = "lowpass";
+    f.frequency.setValueAtTime(filterFreq || 900, t);
+    f.frequency.exponentialRampToValueAtTime(120, t + dur);
+    const g = audio.createGain();
+    g.gain.setValueAtTime(vol || 0.3, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    src.connect(f).connect(g).connect(audio.destination);
+    src.start(t);
+  }
+  const sfx = {
+    slide()   { noiseBurst(0.07, 0.08, 1800); },
+    merge(t)  { tone(300 + t * 70, 0.12, "triangle", 0.13, (300 + t * 70) * 1.6); },
+    bigMerge(){ [660, 880, 1320].forEach((f, i) => setTimeout(() => tone(f, 0.15, "triangle", 0.12), i * 60)); },
+    over()    { noiseBurst(0.45, 0.3, 600); tone(220, 0.5, "sawtooth", 0.15, 55); },
+    best()    { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => tone(f, 0.18, "triangle", 0.14), i * 90)); },
+    start()   { tone(440, 0.1, "triangle", 0.12, 880); },
+    undo()    { tone(500, 0.15, "sine", 0.12, 250); },
+    buy()     { tone(700, 0.07, "square", 0.08); setTimeout(() => tone(1050, 0.12, "square", 0.08), 70); },
+    deny()    { tone(180, 0.15, "square", 0.08, 120); }
+  };
+
+  // ---------- State ----------
+  const ST_MENU = 0, ST_PLAY = 1, ST_DEAD = 2;
+  let state = ST_MENU;
+
+  let grid, score, runPts, undoLeft, undoSnap, anims, animT, pendingSounds, deathT;
+  let particles, popups, stars, shake, flash;
+  let uiRects = {};
+
+  function makeStars() {
+    stars = [];
+    const n = Math.floor((W * H) / 9000);
+    for (let i = 0; i < n; i++) {
+      stars.push({
+        x: Math.random() * W,
+        y: Math.random() * H,
+        r: Math.random() * 1.4 + 0.3,
+        tw: Math.random() * Math.PI * 2,
+        sp: 0.5 + Math.random() * 1.5
+      });
+    }
+  }
+  makeStars();
+  window.addEventListener("resize", makeStars);
+
+  function emptyGrid() {
+    return Array.from({ length: N }, () => Array(N).fill(0));
+  }
+
+  function spawnValue() {
+    const four = 0.1 + save.start * 0.08;
+    const eight = save.start > 2 ? (save.start - 2) * 0.05 : 0;
+    const r = Math.random();
+    if (r < eight) return 8;
+    if (r < eight + four) return 4;
+    return 2;
+  }
+
+  function spawnTile(g) {
+    const empties = [];
+    for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) if (!g[r][c]) empties.push([r, c]);
+    if (!empties.length) return null;
+    const [r, c] = empties[Math.floor(Math.random() * empties.length)];
+    g[r][c] = spawnValue();
+    return { r, c, val: g[r][c] };
+  }
+
+  function canMove(g) {
+    for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
+      if (!g[r][c]) return true;
+      if (c + 1 < N && g[r][c] === g[r][c + 1]) return true;
+      if (r + 1 < N && g[r][c] === g[r + 1][c]) return true;
+    }
+    return false;
+  }
+
+  function reset() {
+    grid = emptyGrid();
+    spawnTile(grid);
+    spawnTile(grid);
+    score = 0;
+    runPts = 0;
+    undoLeft = save.undo;
+    undoSnap = null;
+    anims = null;
+    animT = 0;
+    pendingSounds = [];
+    particles = [];
+    popups = [];
+    shake = 0;
+    flash = 0;
+    deathT = 0;
+  }
+  reset();
+
+  // ---------- Move logic ----------
+  // dir: 0=left 1=right 2=up 3=down
+  function tryMove(dir) {
+    if (state !== ST_PLAY || anims) return;
+    const g = grid;
+    const newG = emptyGrid();
+    const moves = [];    // {val, fr, fc, tr, tc, dies}
+    const merges = [];   // {r, c, val}
+    let moved = false;
+
+    const horiz = dir === 0 || dir === 1;
+    const rev = dir === 1 || dir === 3;
+
+    for (let line = 0; line < N; line++) {
+      const cells = [];
+      for (let i = 0; i < N; i++) {
+        const idx = rev ? N - 1 - i : i;
+        const r = horiz ? line : idx;
+        const c = horiz ? idx : line;
+        if (g[r][c]) cells.push({ r, c, val: g[r][c] });
+      }
+      let out = 0;
+      for (let i = 0; i < cells.length; i++) {
+        const outIdx = rev ? N - 1 - out : out;
+        const tr = horiz ? line : outIdx;
+        const tc = horiz ? outIdx : line;
+        if (i + 1 < cells.length && cells[i].val === cells[i + 1].val) {
+          const nv = cells[i].val * 2;
+          newG[tr][tc] = nv;
+          moves.push({ val: cells[i].val, fr: cells[i].r, fc: cells[i].c, tr, tc, dies: false, becomes: nv });
+          moves.push({ val: cells[i + 1].val, fr: cells[i + 1].r, fc: cells[i + 1].c, tr, tc, dies: true });
+          merges.push({ r: tr, c: tc, val: nv });
+          if (cells[i].r !== tr || cells[i].c !== tc || true) moved = true;
+          i++;
+        } else {
+          newG[tr][tc] = cells[i].val;
+          moves.push({ val: cells[i].val, fr: cells[i].r, fc: cells[i].c, tr, tc, dies: false });
+          if (cells[i].r !== tr || cells[i].c !== tc) moved = true;
+        }
+        out++;
+      }
+    }
+
+    if (!moved) return;
+
+    undoSnap = { grid: g.map(row => row.slice()), score, runPts };
+    grid = newG;
+    anims = { moves, merges };
+    animT = 0;
+    sfx.slide();
+  }
+
+  function finishMove() {
+    const { merges } = anims;
+    anims = null;
+    let big = false;
+    for (const m of merges) {
+      score += m.val;
+      const t = tierOf(m.val);
+      const earn = Math.floor((m.val / 16) * goldFactor());
+      if (earn > 0) {
+        runPts += earn;
+        save.pts += earn;
+        const p = cellPos(m.r, m.c), s = cellSize();
+        popup(p.x + s / 2, p.y, `+${earn}✦`, "#b78bff");
+      }
+      sfx.merge(t);
+      if (m.val >= 64) {
+        big = true;
+        const p = cellPos(m.r, m.c), s = cellSize();
+        burst(p.x + s / 2, p.y + s / 2, 14, "#b78bff", 150);
+      }
+      if (m.val >= 512) {
+        popup(CX, boardY() - UNIT * 0.02, TIERS[tierOf(m.val)] + " " + m.val + "!", "#ffd166", true);
+      }
+    }
+    if (big) sfx.bigMerge();
+    if (score > save.best) save.best = score;
+    persist();
+
+    spawnTile(grid);
+    if (!canMove(grid)) {
+      state = ST_DEAD;
+      deathT = performance.now();
+      shake = 0.8;
+      flash = 0.6;
+      sfx.over();
+      if (score >= save.best && score > 0) setTimeout(() => sfx.best(), 500);
+      persist();
+    }
+  }
+
+  function doUndo() {
+    if (state !== ST_PLAY || anims || !undoSnap || undoLeft <= 0) { sfx.deny(); return; }
+    grid = undoSnap.grid;
+    score = undoSnap.score;
+    // points already banked stay banked; just restore the board and score
+    undoSnap = null;
+    undoLeft--;
+    sfx.undo();
+    flash = 0.15;
+  }
+
+  // ---------- Input ----------
+  function inRect(x, y, r) { return r && x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function handleTap(x, y) {
+    if (x != null && inRect(x, y, uiRects.mute)) {
+      save.muted = !save.muted;
+      persist();
+      if (!save.muted) tone(660, 0.08, "sine", 0.1);
+      return;
+    }
+    if (state === ST_PLAY) {
+      if (x != null && inRect(x, y, uiRects.undo)) doUndo();
+      return;
+    }
+    if (x != null) {
+      for (const key of Object.keys(UPGRADES)) {
+        if (inRect(x, y, uiRects[key])) { tryBuy(key); return; }
+      }
+    }
+    if (state === ST_MENU || (state === ST_DEAD && performance.now() - deathT > 600)) {
+      reset();
+      state = ST_PLAY;
+      sfx.start();
+    }
+  }
+
+  let swipe = null;
+  window.addEventListener("pointerdown", e => {
+    e.preventDefault();
+    ensureAudio();
+    swipe = { x: e.clientX, y: e.clientY };
+  }, { passive: false });
+  window.addEventListener("pointerup", e => {
+    e.preventDefault();
+    if (!swipe) return;
+    const dx = e.clientX - swipe.x;
+    const dy = e.clientY - swipe.y;
+    swipe = null;
+    const dist = Math.hypot(dx, dy);
+    if (dist < 24) { handleTap(e.clientX, e.clientY); return; }
+    if (state !== ST_PLAY) return;
+    if (Math.abs(dx) > Math.abs(dy)) tryMove(dx > 0 ? 1 : 0);
+    else tryMove(dy > 0 ? 3 : 2);
+  }, { passive: false });
+  window.addEventListener("keydown", e => {
+    if (e.code === "ArrowLeft")  { e.preventDefault(); ensureAudio(); tryMove(0); }
+    if (e.code === "ArrowRight") { e.preventDefault(); ensureAudio(); tryMove(1); }
+    if (e.code === "ArrowUp")    { e.preventDefault(); ensureAudio(); tryMove(2); }
+    if (e.code === "ArrowDown")  { e.preventDefault(); ensureAudio(); tryMove(3); }
+    if (e.code === "Space" || e.code === "Enter") { e.preventDefault(); ensureAudio(); handleTap(null, null); }
+    if (e.code === "KeyZ") { doUndo(); }
+    if (e.code === "KeyM") { save.muted = !save.muted; persist(); }
+  });
+
+  function tryBuy(key) {
+    const u = UPGRADES[key];
+    const lvl = save[key];
+    if (lvl >= u.max) { sfx.deny(); return; }
+    const cost = u.cost(lvl);
+    if (Math.floor(save.pts) >= cost) {
+      save.pts -= cost;
+      save[key]++;
+      persist();
+      sfx.buy();
+      const r = uiRects[key];
+      if (r) burst(r.x + r.w / 2, r.y, 14, "#b78bff", 130);
+    } else {
+      sfx.deny();
+      flash = Math.max(flash, 0.1);
+    }
+  }
+
+  // ---------- FX helpers ----------
+  function burst(x, y, n, color, spd) {
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const s = spd * (0.4 + Math.random() * 0.9);
+      particles.push({
+        x, y,
+        vx: Math.cos(a) * s, vy: Math.sin(a) * s,
+        life: 1, decay: 1.6 + Math.random() * 1.4,
+        r: 1.5 + Math.random() * 2.5, color
+      });
+    }
+  }
+  function popup(x, y, text, color, big) {
+    popups.push({ x, y, text, color, life: 1, big: !!big });
+  }
+
+  // ---------- Update ----------
+  function update(dt) {
+    for (const s of stars) s.tw += s.sp * dt;
+    if (save.comet > 0) save.pts += (COMET_RATE * save.comet / 60) * dt;
+    offlineToast = Math.max(0, offlineToast - dt);
+
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      p.vx *= 0.98; p.vy *= 0.98;
+      p.life -= p.decay * dt;
+      if (p.life <= 0) particles.splice(i, 1);
+    }
+    for (let i = popups.length - 1; i >= 0; i--) {
+      const p = popups[i];
+      p.y -= 30 * dt;
+      p.life -= (p.big ? 0.9 : 1.2) * dt;
+      if (p.life <= 0) popups.splice(i, 1);
+    }
+    shake = Math.max(0, shake - dt * 3);
+    flash = Math.max(0, flash - dt * 2.5);
+
+    if (anims) {
+      animT += dt;
+      if (animT >= ANIM_T) finishMove();
+    }
+  }
+
+  // ---------- Draw ----------
+  function roundRect(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function tileColor(val) {
+    const t = tierOf(val);
+    return `hsl(${(255 + t * 22) % 360}, 55%, ${34 + Math.min(t * 2, 14)}%)`;
+  }
+
+  function drawTile(x, y, val, scale) {
+    const s = cellSize();
+    const t = tierOf(val);
+    ctx.save();
+    ctx.translate(x + s / 2, y + s / 2);
+    ctx.scale(scale, scale);
+    if (val >= 128) {
+      ctx.shadowColor = "#b78bff";
+      ctx.shadowBlur = 14;
+    }
+    roundRect(-s / 2, -s / 2, s, s, s * 0.14);
+    ctx.fillStyle = tileColor(val);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(255,255,255,0.25)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.textAlign = "center";
+    ctx.font = `${Math.round(s * 0.42)}px -apple-system, sans-serif`;
+    ctx.fillText(TIERS[t], 0, s * 0.08);
+    ctx.font = `800 ${Math.round(s * 0.17)}px -apple-system, sans-serif`;
+    ctx.fillStyle = "rgba(255,255,255,0.92)";
+    ctx.fillText(String(val), 0, s * 0.36);
+    ctx.restore();
+  }
+
+  function drawPts(x, y, size) {
+    ctx.textAlign = "left";
+    ctx.fillStyle = "#b78bff";
+    ctx.font = `700 ${Math.round(size)}px -apple-system, sans-serif`;
+    ctx.fillText("✦ " + Math.floor(save.pts), x, y);
+  }
+
+  function drawShopCard(key, x, y, w, h) {
+    const u = UPGRADES[key];
+    const lvl = save[key];
+    const maxed = lvl >= u.max;
+    const cost = maxed ? 0 : u.cost(lvl);
+    const afford = !maxed && Math.floor(save.pts) >= cost;
+
+    uiRects[key] = { x, y, w, h };
+    roundRect(x, y, w, h, 10);
+    ctx.fillStyle = afford ? "rgba(50,35,90,0.88)" : "rgba(26,20,50,0.82)";
+    ctx.fill();
+    ctx.strokeStyle = afford ? "rgba(183,139,255,0.85)" : "rgba(183,139,255,0.2)";
+    ctx.lineWidth = afford ? 2 : 1;
+    ctx.stroke();
+
+    const cxm = x + w / 2;
+    ctx.textAlign = "center";
+    ctx.font = `${Math.round(h * 0.26)}px -apple-system, sans-serif`;
+    ctx.fillStyle = "#fff";
+    ctx.fillText(u.icon, cxm, y + h * 0.30);
+    ctx.font = `800 ${Math.round(h * 0.14)}px -apple-system, sans-serif`;
+    ctx.fillText(`${u.name} ${lvl > 0 ? "Lv" + lvl : ""}`, cxm, y + h * 0.50);
+    ctx.font = `600 ${Math.round(h * 0.115)}px -apple-system, sans-serif`;
+    ctx.fillStyle = "rgba(255,255,255,0.6)";
+    ctx.fillText(maxed ? u.desc(lvl) : u.desc(lvl + 1), cxm, y + h * 0.66);
+    ctx.font = `800 ${Math.round(h * 0.14)}px -apple-system, sans-serif`;
+    ctx.fillStyle = maxed ? "#ffd166" : (afford ? "#b78bff" : "rgba(183,139,255,0.4)");
+    ctx.fillText(maxed ? "MAX" : "✦ " + cost, cxm, y + h * 0.86);
+  }
+
+  function shopTop() {
+    const gap = UNIT * 0.016;
+    const cw = Math.min((W - gap * 5) / 4, UNIT * 0.26);
+    return H - cw * 0.88 - Math.max(16, H * 0.03);
+  }
+
+  function drawShop() {
+    const gap = UNIT * 0.016;
+    const keys = ["start", "undo", "gold", "comet"];
+    const n = keys.length;
+    const cw = Math.min((W - gap * (n + 1)) / n, UNIT * 0.26);
+    const chh = cw * 0.88;
+    const total = cw * n + gap * (n - 1);
+    const x0 = CX - total / 2;
+    const y = shopTop();
+    for (let i = 0; i < n; i++) drawShopCard(keys[i], x0 + i * (cw + gap), y, cw, chh);
+  }
+
+  function draw() {
+    uiRects = {};
+    ctx.save();
+    if (shake > 0) {
+      ctx.translate((Math.random() - 0.5) * shake * 12, (Math.random() - 0.5) * shake * 12);
+    }
+
+    const g = ctx.createRadialGradient(CX, H * 0.35, 0, CX, H * 0.35, UNIT);
+    g.addColorStop(0, "#151038");
+    g.addColorStop(1, "#080714");
+    ctx.fillStyle = g;
+    ctx.fillRect(-20, -20, W + 40, H + 40);
+
+    for (const s of stars) {
+      ctx.globalAlpha = 0.35 + 0.35 * Math.sin(s.tw);
+      ctx.fillStyle = "#cdd6ff";
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // board
+    const bs = boardSize();
+    roundRect(boardX(), boardY(), bs, bs, bs * 0.03);
+    ctx.fillStyle = "rgba(30,25,65,0.7)";
+    ctx.fill();
+    ctx.strokeStyle = "rgba(183,139,255,0.3)";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
+      const p = cellPos(r, c), s = cellSize();
+      roundRect(p.x, p.y, s, s, s * 0.14);
+      ctx.fillStyle = "rgba(255,255,255,0.05)";
+      ctx.fill();
+    }
+
+    // tiles
+    if (anims) {
+      const k = Math.min(1, animT / ANIM_T);
+      const ease = 1 - Math.pow(1 - k, 3);
+      for (const m of anims.moves) {
+        const from = cellPos(m.fr, m.fc);
+        const to = cellPos(m.tr, m.tc);
+        const x = from.x + (to.x - from.x) * ease;
+        const y = from.y + (to.y - from.y) * ease;
+        drawTile(x, y, m.val, 1);
+      }
+    } else if (state !== ST_MENU) {
+      for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
+        if (!grid[r][c]) continue;
+        const p = cellPos(r, c);
+        drawTile(p.x, p.y, grid[r][c], 1);
+      }
+    } else {
+      // menu: decorative sample tiles
+      const demo = [[2,0,0,4],[0,8,16,0],[0,64,32,0],[128,0,0,256]];
+      for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
+        if (!demo[r][c]) continue;
+        const p = cellPos(r, c);
+        drawTile(p.x, p.y, demo[r][c], 0.92);
+      }
+    }
+
+    // particles
+    for (const p of particles) {
+      ctx.globalAlpha = Math.max(0, p.life);
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // popups
+    for (const p of popups) {
+      ctx.globalAlpha = Math.max(0, p.life);
+      ctx.fillStyle = p.color;
+      ctx.font = `bold ${Math.round(UNIT * (p.big ? 0.036 : 0.026))}px -apple-system, sans-serif`;
+      ctx.textAlign = "center";
+      ctx.fillText(p.text, p.x, p.y);
+    }
+    ctx.globalAlpha = 1;
+
+    // ---- HUD ----
+    const pad = Math.max(14, UNIT * 0.03);
+    drawPts(pad, pad + UNIT * 0.02, UNIT * 0.030);
+    const mb = { w: UNIT * 0.075, h: UNIT * 0.075 };
+    uiRects.mute = { x: W - pad - mb.w, y: pad - mb.h * 0.25, w: mb.w, h: mb.h };
+    ctx.textAlign = "right";
+    ctx.font = `${Math.round(UNIT * 0.040)}px -apple-system, sans-serif`;
+    ctx.globalAlpha = 0.85;
+    ctx.fillText(save.muted ? "🔇" : "🔊", W - pad, pad + UNIT * 0.025);
+    ctx.globalAlpha = 1;
+
+    if (state === ST_PLAY || state === ST_DEAD) {
+      ctx.fillStyle = "#ffffff";
+      ctx.font = `bold ${Math.round(UNIT * 0.05)}px -apple-system, sans-serif`;
+      ctx.textAlign = "center";
+      ctx.fillText(String(score), CX, UNIT * 0.075);
+      ctx.fillStyle = "rgba(255,255,255,0.45)";
+      ctx.font = `600 ${Math.round(UNIT * 0.022)}px -apple-system, sans-serif`;
+      ctx.fillText(`BEST ${save.best}`, CX, UNIT * 0.105);
+    }
+
+    // undo chip
+    if (state === ST_PLAY && save.undo > 0) {
+      const uw = UNIT * 0.14, uh = UNIT * 0.055;
+      const ux = pad, uy = pad + UNIT * 0.035;
+      uiRects.undo = { x: ux, y: uy, w: uw, h: uh };
+      roundRect(ux, uy, uw, uh, 8);
+      ctx.fillStyle = undoLeft > 0 ? "rgba(183,139,255,0.18)" : "rgba(255,255,255,0.05)";
+      ctx.fill();
+      ctx.strokeStyle = undoLeft > 0 ? "rgba(183,139,255,0.6)" : "rgba(255,255,255,0.15)";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.textAlign = "center";
+      ctx.fillStyle = undoLeft > 0 ? "#e6d6ff" : "rgba(255,255,255,0.3)";
+      ctx.font = `700 ${Math.round(uh * 0.5)}px -apple-system, sans-serif`;
+      ctx.fillText(`↩ ${undoLeft}`, ux + uw / 2, uy + uh * 0.65);
+    }
+
+    if (state === ST_MENU) {
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#ffffff";
+      ctx.font = `800 ${Math.round(UNIT * 0.075)}px -apple-system, sans-serif`;
+      ctx.fillText("NOVA MERGE", CX, H * 0.09);
+      ctx.fillStyle = "#b78bff";
+      ctx.font = `600 ${Math.round(UNIT * 0.026)}px -apple-system, sans-serif`;
+      ctx.fillText("swipe to merge · fuse comets into galaxies", CX, H * 0.09 + UNIT * 0.05);
+      const tapY = Math.min(boardY() + boardSize() + UNIT * 0.09, shopTop() - UNIT * 0.03);
+      if (save.best > 0) {
+        ctx.fillStyle = "rgba(255,255,255,0.6)";
+        ctx.fillText(`BEST ${save.best}`, CX, tapY - UNIT * 0.06);
+      }
+      const pulse = 0.6 + 0.4 * Math.sin(performance.now() / 350);
+      ctx.globalAlpha = pulse;
+      ctx.fillStyle = "#ffffff";
+      ctx.font = `700 ${Math.round(UNIT * 0.036)}px -apple-system, sans-serif`;
+      ctx.fillText("TAP TO PLAY", CX, tapY);
+      ctx.globalAlpha = 1;
+      drawShop();
+
+      if (offlineToast > 0 && offlineEarned > 0) {
+        ctx.globalAlpha = Math.min(1, offlineToast);
+        roundRect(CX - UNIT * 0.28, boardY() + boardSize() * 0.38, UNIT * 0.56, UNIT * 0.085, 10);
+        ctx.fillStyle = "rgba(183,139,255,0.14)";
+        ctx.fill();
+        ctx.strokeStyle = "rgba(183,139,255,0.7)";
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        ctx.fillStyle = "#d9c6ff";
+        ctx.textAlign = "center";
+        ctx.font = `700 ${Math.round(UNIT * 0.026)}px -apple-system, sans-serif`;
+        ctx.fillText(`while you were away: +${offlineEarned} ✦`, CX, boardY() + boardSize() * 0.38 + UNIT * 0.053);
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    if (state === ST_DEAD) {
+      ctx.fillStyle = "rgba(8,7,20,0.6)";
+      ctx.fillRect(-20, -20, W + 40, H + 40);
+      drawPts(pad, pad + UNIT * 0.02, UNIT * 0.030);
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#ff5470";
+      ctx.font = `800 ${Math.round(UNIT * 0.055)}px -apple-system, sans-serif`;
+      ctx.fillText("OUT OF SPACE", CX, H * 0.30);
+      ctx.fillStyle = "#ffffff";
+      ctx.font = `bold ${Math.round(UNIT * 0.07)}px -apple-system, sans-serif`;
+      ctx.fillText(String(score), CX, H * 0.30 + UNIT * 0.085);
+      const isBest = score >= save.best && save.best > 0;
+      ctx.fillStyle = isBest ? "#ffd166" : "rgba(255,255,255,0.6)";
+      ctx.font = `600 ${Math.round(UNIT * 0.028)}px -apple-system, sans-serif`;
+      ctx.fillText(isBest ? "★ NEW BEST ★" : `BEST ${save.best}`, CX, H * 0.30 + UNIT * 0.13);
+      ctx.fillStyle = "#b78bff";
+      ctx.font = `700 ${Math.round(UNIT * 0.032)}px -apple-system, sans-serif`;
+      ctx.fillText(`+${runPts} ✦ earned`, CX, H * 0.30 + UNIT * 0.185);
+      if (performance.now() - deathT > 600) {
+        const pulse = 0.6 + 0.4 * Math.sin(performance.now() / 350);
+        ctx.globalAlpha = pulse;
+        ctx.fillStyle = "#ffffff";
+        ctx.font = `700 ${Math.round(UNIT * 0.032)}px -apple-system, sans-serif`;
+        ctx.fillText("TAP TO RETRY", CX, H * 0.30 + UNIT * 0.245);
+        ctx.globalAlpha = 1;
+      }
+      drawShop();
+    }
+
+    if (flash > 0) {
+      ctx.globalAlpha = flash * 0.25;
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(-20, -20, W + 40, H + 40);
+      ctx.globalAlpha = 1;
+    }
+
+    ctx.restore();
+  }
+
+  // read-only state snapshot for automated testing
+  const IS_TEST = new URLSearchParams(location.search).has("test");
+  window.__mergeDebug = () => ({
+    state, score, best: save.best, pts: Math.floor(save.pts),
+    undoLeft, animating: !!anims,
+    grid: grid.map(row => row.slice()),
+    canMove: canMove(grid)
+  });
+  if (IS_TEST) {
+    // test-only helper: set the board directly to exercise edge cases
+    window.__mergeTest = {
+      setGrid(vals) { grid = vals.map(row => row.slice()); anims = null; },
+      move(dir) { tryMove(dir); }
+    };
+  }
+
+  // ---------- Loop ----------
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.033, (now - last) / 1000);
+    last = now;
+    update(dt);
+    draw();
+  }
+  if (IS_TEST) {
+    // test mode: keep simulating even when the tab is hidden. Hidden tabs
+    // throttle timers, so each tick runs enough fixed steps to cover the
+    // real elapsed time instead of relying on tick frequency.
+    let tLast = performance.now();
+    setInterval(() => {
+      const now = performance.now();
+      let steps = Math.min(Math.round((now - tLast) / (1000 / 60)), 300);
+      tLast = now;
+      while (steps-- > 0) update(1 / 60);
+      draw();
+    }, 16);
+  } else {
+    const loop = now => { frame(now); requestAnimationFrame(loop); };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
