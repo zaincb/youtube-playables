@@ -850,8 +850,17 @@
     draw();
   }
   if (new URLSearchParams(location.search).has("test")) {
-    // test mode: keep simulating even when the tab is hidden (rAF throttles)
-    setInterval(() => frame(performance.now()), 16);
+    // test mode: keep simulating even when the tab is hidden. Hidden tabs
+    // throttle timers, so each tick runs enough fixed steps to cover the
+    // real elapsed time instead of relying on tick frequency.
+    let tLast = performance.now();
+    setInterval(() => {
+      const now = performance.now();
+      let steps = Math.min(Math.round((now - tLast) / (1000 / 60)), 300);
+      tLast = now;
+      while (steps-- > 0) update(1 / 60);
+      draw();
+    }, 16);
   } else {
     const loop = now => { frame(now); requestAnimationFrame(loop); };
     requestAnimationFrame(loop);
