@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Orbit Dash</title>
+<meta name="description" content="Orbit Dash — a one-tap arcade game. Leap between orbit rings, dodge asteroids, chase your high score.">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    overflow: hidden;
+    background: #060714;
+    touch-action: manipulation;
+    -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(() => {
+  "use strict";
+
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+
+  let W = 0, H = 0, DPR = 1, CX = 0, CY = 0, UNIT = 0;
+
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W * DPR;
+    canvas.height = H * DPR;
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    CX = W / 2;
+    CY = H / 2;
+    UNIT = Math.min(W, H);
+  }
+  window.addEventListener("resize", resize);
+  resize();
+
+  // ---------- Config ----------
+  const RINGS = 3;
+  const ringRadius = i => UNIT * (0.16 + i * 0.115);   // ring index 0..2
+  const SHIP_R = () => UNIT * 0.020;
+  const AST_R = () => UNIT * 0.026;
+  const PLANET_R = () => UNIT * 0.075;
+  const BASE_SPEED = 1.35;          // rad/s ship angular speed at start
+  const MAX_SPEED = 3.1;
+  const SPEED_RAMP = 0.016;         // rad/s gained per second
+  const SPAWN_START = 1.5;          // seconds between spawns at start
+  const SPAWN_MIN = 0.55;
+  const RING_SNAP = 14;             // lerp rate for ring switching
+
+  // ---------- State ----------
+  const ST_MENU = 0, ST_PLAY = 1, ST_DEAD = 2;
+  let state = ST_MENU;
+
+  let ship, asteroids, particles, stars, popups;
+  let score, best, speed, spawnTimer, spawnInterval, elapsed, shake, flash, deathInfo;
+
+  try { best = parseInt(localStorage.getItem("orbitdash_best") || "0", 10) || 0; }
+  catch (e) { best = 0; }
+
+  function makeStars() {
+    stars = [];
+    const n = Math.floor((W * H) / 9000);
+    for (let i = 0; i < n; i++) {
+      stars.push({
+        x: Math.random() * W,
+        y: Math.random() * H,
+        r: Math.random() * 1.4 + 0.3,
+        tw: Math.random() * Math.PI * 2,
+        sp: 0.5 + Math.random() * 1.5
+      });
+    }
+  }
+  makeStars();
+  window.addEventListener("resize", makeStars);
+
+  function reset() {
+    ship = { ring: 0, r: ringRadius(0), a: -Math.PI / 2, trail: [] };
+    asteroids = [];
+    particles = [];
+    popups = [];
+    score = 0;
+    speed = BASE_SPEED;
+    elapsed = 0;
+    spawnTimer = 0.8;
+    spawnInterval = SPAWN_START;
+    shake = 0;
+    flash = 0;
+    deathInfo = null;
+  }
+  reset();
+
+  // ---------- Input ----------
+  function tap() {
+    if (state === ST_MENU) {
+      reset();
+      state = ST_PLAY;
+      return;
+    }
+    if (state === ST_PLAY) {
+      ship.ring = (ship.ring + 1) % RINGS;
+      burst(shipX(), shipY(), 6, "#7df9ff", 90);
+      return;
+    }
+    if (state === ST_DEAD && deathInfo && performance.now() - deathInfo.t > 600) {
+      reset();
+      state = ST_PLAY;
+    }
+  }
+  window.addEventListener("pointerdown", e => { e.preventDefault(); tap(); }, { passive: false });
+  window.addEventListener("keydown", e => {
+    if (e.code === "Space" || e.code === "ArrowUp" || e.code === "Enter") { e.preventDefault(); tap(); }
+  });
+
+  // ---------- Helpers ----------
+  const shipX = () => CX + Math.cos(ship.a) * ship.r;
+  const shipY = () => CY + Math.sin(ship.a) * ship.r;
+
+  function burst(x, y, n, color, spd) {
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const s = spd * (0.4 + Math.random() * 0.9);
+      particles.push({
+        x, y,
+        vx: Math.cos(a) * s, vy: Math.sin(a) * s,
+        life: 1, decay: 1.6 + Math.random() * 1.4,
+        r: 1.5 + Math.random() * 2.5, color
+      });
+    }
+  }
+
+  function popup(x, y, text, color) {
+    popups.push({ x, y, text, color, life: 1 });
+  }
+
+  function angDiff(a, b) {
+    let d = (a - b) % (Math.PI * 2);
+    if (d > Math.PI) d -= Math.PI * 2;
+    if (d < -Math.PI) d += Math.PI * 2;
+    return d;
+  }
+
+  function spawnAsteroid() {
+    // Pick a ring, spawn away from the ship's current angle
+    const ring = Math.floor(Math.random() * RINGS);
+    let a;
+    let tries = 0;
+    do {
+      a = Math.random() * Math.PI * 2;
+      tries++;
+    } while (ring === ship.ring && Math.abs(angDiff(a, ship.a)) < 1.1 && tries < 12);
+    // Orbit against the ship or slowly with it
+    const dir = Math.random() < 0.65 ? -1 : 1;
+    const sp = (0.25 + Math.random() * 0.5) * dir;
+    asteroids.push({
+      ring, a, sp,
+      r: AST_R() * (0.8 + Math.random() * 0.5),
+      rot: Math.random() * Math.PI * 2,
+      rotSp: (Math.random() - 0.5) * 3,
+      verts: makeAsteroidShape(),
+      scored: false,
+      born: 0   // fade/grow in, harmless briefly
+    });
+  }
+
+  function makeAsteroidShape() {
+    const v = [];
+    const n = 8 + Math.floor(Math.random() * 3);
+    for (let i = 0; i < n; i++) {
+      v.push(0.7 + Math.random() * 0.35);
+    }
+    return v;
+  }
+
+  // ---------- Update ----------
+  function update(dt) {
+    // stars twinkle always
+    for (const s of stars) s.tw += s.sp * dt;
+
+    // particles always
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      p.vx *= 0.98; p.vy *= 0.98;
+      p.life -= p.decay * dt;
+      if (p.life <= 0) particles.splice(i, 1);
+    }
+    for (let i = popups.length - 1; i >= 0; i--) {
+      const p = popups[i];
+      p.y -= 30 * dt;
+      p.life -= 1.2 * dt;
+      if (p.life <= 0) popups.splice(i, 1);
+    }
+    shake = Math.max(0, shake - dt * 3);
+    flash = Math.max(0, flash - dt * 2.5);
+
+    if (state !== ST_PLAY) {
+      // menu: idle drift of demo asteroids
+      for (const ast of asteroids) { ast.a += ast.sp * dt; ast.rot += ast.rotSp * dt; ast.born = Math.min(1, ast.born + dt * 2); }
+      return;
+    }
+
+    elapsed += dt;
+    speed = Math.min(MAX_SPEED, BASE_SPEED + elapsed * SPEED_RAMP);
+    spawnInterval = Math.max(SPAWN_MIN, SPAWN_START - elapsed * 0.02);
+
+    // ship
+    ship.a += speed * dt;
+    const target = ringRadius(ship.ring);
+    ship.r += (target - ship.r) * Math.min(1, RING_SNAP * dt);
+    ship.trail.push({ x: shipX(), y: shipY(), life: 1 });
+    if (ship.trail.length > 26) ship.trail.shift();
+    for (const t of ship.trail) t.life -= dt * 2.2;
+
+    // score: passive time score
+    const prevScore = Math.floor(score);
+    score += dt * 10;
+    if (Math.floor(score / 100) > Math.floor(prevScore / 100)) flash = 0.25;
+
+    // asteroids
+    spawnTimer -= dt;
+    if (spawnTimer <= 0) {
+      spawnAsteroid();
+      spawnTimer = spawnInterval;
+      // occasionally double-spawn later on
+      if (elapsed > 25 && Math.random() < 0.35) spawnAsteroid();
+    }
+
+    const sx = shipX(), sy = shipY();
+    for (let i = asteroids.length - 1; i >= 0; i--) {
+      const ast = asteroids[i];
+      ast.a += ast.sp * dt;
+      ast.rot += ast.rotSp * dt;
+      ast.born = Math.min(1, ast.born + dt * 2);
+
+      const ar = ringRadius(ast.ring);
+      const ax = CX + Math.cos(ast.a) * ar;
+      const ay = CY + Math.sin(ast.a) * ar;
+
+      // cull very old asteroids to keep the field fair (cap count)
+      if (asteroids.length > 26 && i === 0) { asteroids.splice(i, 1); continue; }
+
+      const dx = ax - sx, dy = ay - sy;
+      const dist = Math.hypot(dx, dy);
+      const hitDist = ast.r + SHIP_R() * 0.9;
+
+      if (ast.born >= 1 && dist < hitDist) {
+        // death
+        state = ST_DEAD;
+        deathInfo = { t: performance.now() };
+        shake = 1;
+        flash = 0.8;
+        burst(sx, sy, 40, "#ff5470", 260);
+        burst(sx, sy, 25, "#ffd166", 200);
+        const fs = Math.floor(score);
+        if (fs > best) {
+          best = fs;
+          try { localStorage.setItem("orbitdash_best", String(best)); } catch (e) {}
+        }
+        return;
+      }
+
+      // near-miss bonus: same ring, passed close by
+      if (!ast.scored && ast.ring === ship.ring && ast.born >= 1 && dist < hitDist * 3 && dist > hitDist) {
+        // only count when moving apart after a close approach
+        ast.nearMiss = true;
+      }
+      if (ast.nearMiss && !ast.scored && dist > hitDist * 3.2) {
+        ast.scored = true;
+        score += 25;
+        popup(ax, ay, "+25", "#7df9ff");
+        burst(ax, ay, 5, "#7df9ff", 70);
+      }
+    }
+  }
+
+  // ---------- Draw ----------
+  function roundRect(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function draw() {
+    ctx.save();
+    if (shake > 0) {
+      ctx.translate((Math.random() - 0.5) * shake * 14, (Math.random() - 0.5) * shake * 14);
+    }
+
+    // background
+    const g = ctx.createRadialGradient(CX, CY, 0, CX, CY, UNIT * 0.9);
+    g.addColorStop(0, "#101334");
+    g.addColorStop(1, "#060714");
+    ctx.fillStyle = g;
+    ctx.fillRect(-20, -20, W + 40, H + 40);
+
+    // stars
+    for (const s of stars) {
+      ctx.globalAlpha = 0.35 + 0.35 * Math.sin(s.tw);
+      ctx.fillStyle = "#cdd6ff";
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // rings
+    for (let i = 0; i < RINGS; i++) {
+      ctx.beginPath();
+      ctx.arc(CX, CY, ringRadius(i), 0, Math.PI * 2);
+      const active = state === ST_PLAY && ship.ring === i;
+      ctx.strokeStyle = active ? "rgba(125,249,255,0.55)" : "rgba(140,150,220,0.20)";
+      ctx.lineWidth = active ? 2.5 : 1.5;
+      ctx.stroke();
+    }
+
+    // planet
+    const pr = PLANET_R();
+    const pg = ctx.createRadialGradient(CX - pr * 0.35, CY - pr * 0.35, pr * 0.1, CX, CY, pr);
+    pg.addColorStop(0, "#9a6bff");
+    pg.addColorStop(0.6, "#5b2fd6");
+    pg.addColorStop(1, "#2c1670");
+    ctx.fillStyle = pg;
+    ctx.beginPath();
+    ctx.arc(CX, CY, pr, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(154,107,255,0.35)";
+    ctx.lineWidth = 6;
+    ctx.beginPath();
+    ctx.arc(CX, CY, pr + 5, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // asteroids
+    for (const ast of asteroids) {
+      const ar = ringRadius(ast.ring);
+      const ax = CX + Math.cos(ast.a) * ar;
+      const ay = CY + Math.sin(ast.a) * ar;
+      ctx.save();
+      ctx.translate(ax, ay);
+      ctx.rotate(ast.rot);
+      const scale = 0.4 + 0.6 * ast.born;
+      ctx.globalAlpha = 0.3 + 0.7 * ast.born;
+      ctx.scale(scale, scale);
+      ctx.beginPath();
+      const n = ast.verts.length;
+      for (let i = 0; i < n; i++) {
+        const a = (i / n) * Math.PI * 2;
+        const rr = ast.r * ast.verts[i];
+        const x = Math.cos(a) * rr, y = Math.sin(a) * rr;
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      }
+      ctx.closePath();
+      ctx.fillStyle = "#8d93a8";
+      ctx.fill();
+      ctx.strokeStyle = "#c3c9dc";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.restore();
+      ctx.globalAlpha = 1;
+    }
+
+    // ship trail
+    if (state === ST_PLAY || state === ST_DEAD) {
+      for (const t of ship.trail) {
+        if (t.life <= 0) continue;
+        ctx.globalAlpha = t.life * 0.4;
+        ctx.fillStyle = "#7df9ff";
+        ctx.beginPath();
+        ctx.arc(t.x, t.y, SHIP_R() * 0.6 * t.life, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // ship
+    if (state === ST_PLAY || state === ST_MENU) {
+      const sx = state === ST_PLAY ? shipX() : CX + Math.cos(performance.now() / 700) * ringRadius(0);
+      const sy = state === ST_PLAY ? shipY() : CY + Math.sin(performance.now() / 700) * ringRadius(0);
+      const heading = state === ST_PLAY ? ship.a + Math.PI / 2 : performance.now() / 700 + Math.PI / 2;
+      ctx.save();
+      ctx.translate(sx, sy);
+      ctx.rotate(heading);
+      const r = SHIP_R();
+      ctx.shadowColor = "#7df9ff";
+      ctx.shadowBlur = 14;
+      ctx.beginPath();
+      ctx.moveTo(0, -r * 1.6);
+      ctx.lineTo(r * 1.1, r * 1.2);
+      ctx.lineTo(0, r * 0.55);
+      ctx.lineTo(-r * 1.1, r * 1.2);
+      ctx.closePath();
+      ctx.fillStyle = "#7df9ff";
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // particles
+    for (const p of particles) {
+      ctx.globalAlpha = Math.max(0, p.life);
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // popups
+    for (const p of popups) {
+      ctx.globalAlpha = Math.max(0, p.life);
+      ctx.fillStyle = p.color;
+      ctx.font = `bold ${Math.round(UNIT * 0.028)}px -apple-system, sans-serif`;
+      ctx.textAlign = "center";
+      ctx.fillText(p.text, p.x, p.y);
+    }
+    ctx.globalAlpha = 1;
+
+    // HUD
+    if (state === ST_PLAY) {
+      ctx.fillStyle = "#ffffff";
+      ctx.font = `bold ${Math.round(UNIT * 0.055)}px -apple-system, sans-serif`;
+      ctx.textAlign = "center";
+      ctx.fillText(String(Math.floor(score)), CX, UNIT * 0.09);
+      ctx.fillStyle = "rgba(255,255,255,0.45)";
+      ctx.font = `600 ${Math.round(UNIT * 0.024)}px -apple-system, sans-serif`;
+      ctx.fillText(`BEST ${Math.max(best, Math.floor(score))}`, CX, UNIT * 0.125);
+    }
+
+    // menu
+    if (state === ST_MENU) {
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#ffffff";
+      ctx.font = `800 ${Math.round(UNIT * 0.075)}px -apple-system, sans-serif`;
+      ctx.fillText("ORBIT DASH", CX, CY - UNIT * 0.30);
+      ctx.fillStyle = "#7df9ff";
+      ctx.font = `600 ${Math.round(UNIT * 0.028)}px -apple-system, sans-serif`;
+      ctx.fillText("tap to switch rings · dodge the asteroids", CX, CY - UNIT * 0.245);
+      if (best > 0) {
+        ctx.fillStyle = "rgba(255,255,255,0.6)";
+        ctx.fillText(`BEST ${best}`, CX, CY + UNIT * 0.27);
+      }
+      const pulse = 0.6 + 0.4 * Math.sin(performance.now() / 350);
+      ctx.globalAlpha = pulse;
+      ctx.fillStyle = "#ffffff";
+      ctx.font = `700 ${Math.round(UNIT * 0.036)}px -apple-system, sans-serif`;
+      ctx.fillText("TAP TO PLAY", CX, CY + UNIT * 0.34);
+      ctx.globalAlpha = 1;
+    }
+
+    // game over
+    if (state === ST_DEAD) {
+      ctx.fillStyle = "rgba(6,7,20,0.55)";
+      ctx.fillRect(-20, -20, W + 40, H + 40);
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#ff5470";
+      ctx.font = `800 ${Math.round(UNIT * 0.06)}px -apple-system, sans-serif`;
+      ctx.fillText("GAME OVER", CX, CY - UNIT * 0.10);
+      ctx.fillStyle = "#ffffff";
+      ctx.font = `bold ${Math.round(UNIT * 0.075)}px -apple-system, sans-serif`;
+      ctx.fillText(String(Math.floor(score)), CX, CY);
+      const isBest = Math.floor(score) >= best && best > 0;
+      ctx.fillStyle = isBest ? "#ffd166" : "rgba(255,255,255,0.6)";
+      ctx.font = `600 ${Math.round(UNIT * 0.028)}px -apple-system, sans-serif`;
+      ctx.fillText(isBest ? "★ NEW BEST ★" : `BEST ${best}`, CX, CY + UNIT * 0.05);
+      if (performance.now() - deathInfo.t > 600) {
+        const pulse = 0.6 + 0.4 * Math.sin(performance.now() / 350);
+        ctx.globalAlpha = pulse;
+        ctx.fillStyle = "#ffffff";
+        ctx.font = `700 ${Math.round(UNIT * 0.032)}px -apple-system, sans-serif`;
+        ctx.fillText("TAP TO RETRY", CX, CY + UNIT * 0.14);
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    // flash
+    if (flash > 0) {
+      ctx.globalAlpha = flash * 0.25;
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(-20, -20, W + 40, H + 40);
+      ctx.globalAlpha = 1;
+    }
+
+    ctx.restore();
+  }
+
+  // seed a few demo asteroids for the menu backdrop
+  function seedMenu() {
+    asteroids = [];
+    for (let i = 0; i < 4; i++) {
+      spawnAsteroid();
+      asteroids[i].born = 1;
+    }
+  }
+  seedMenu();
+
+  // ---------- Loop ----------
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.033, (now - last) / 1000);
+    last = now;
+    update(dt);
+    draw();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
