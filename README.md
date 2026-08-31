@@ -8,7 +8,7 @@ Instant-play HTML5 games built for the web — no downloads, no installs, no dep
 
 ### Orbit Dash
 
-A one-tap arcade game. Your ship orbits a planet — tap to leap between orbit rings and dodge asteroids as the speed ramps up. Near-misses earn bonus points; best score is saved locally.
+A one-tap idle arcade game. Your ship orbits a planet — tap to leap between orbit rings and dodge asteroids as the speed ramps up. Runs earn Stardust to spend on upgrades: score boosts, shields, and drones that keep earning even while you are away. Sound effects, near-miss bonuses, and best score all included; progress is saved locally.
 
 - **Play:** https://zaincb.github.io/youtube-playables/orbit-dash/
 - **Controls:** tap / click / spacebar

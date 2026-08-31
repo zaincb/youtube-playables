@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Orbit Dash</title>
-<meta name="description" content="Orbit Dash — a one-tap arcade game. Leap between orbit rings, dodge asteroids, chase your high score.">
+<meta name="description" content="Orbit Dash — a one-tap idle arcade game. Leap between orbit rings, dodge asteroids, earn stardust, and upgrade your ship.">
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body {
@@ -46,26 +46,115 @@
 
   // ---------- Config ----------
   const RINGS = 3;
-  const ringRadius = i => UNIT * (0.16 + i * 0.115);   // ring index 0..2
+  const ringRadius = i => UNIT * (0.16 + i * 0.115);
   const SHIP_R = () => UNIT * 0.020;
   const AST_R = () => UNIT * 0.026;
   const PLANET_R = () => UNIT * 0.075;
-  const BASE_SPEED = 1.35;          // rad/s ship angular speed at start
-  const MAX_SPEED = 3.1;
-  const SPEED_RAMP = 0.016;         // rad/s gained per second
-  const SPAWN_START = 1.5;          // seconds between spawns at start
-  const SPAWN_MIN = 0.55;
-  const RING_SNAP = 14;             // lerp rate for ring switching
+  const BASE_SPEED = 1.5;           // rad/s ship angular speed at start
+  const MAX_SPEED = 3.6;
+  const SPEED_RAMP = 0.022;         // rad/s gained per second
+  const SPAWN_START = 1.2;          // seconds between spawns at start
+  const SPAWN_MIN = 0.45;
+  const RING_SNAP = 14;
+
+  // ---------- Idle economy ----------
+  const DRONE_RATE = 2;             // stardust per minute per drone level
+  const OFFLINE_CAP_MIN = 240;      // offline earnings capped at 4 hours
+  const UPGRADES = {
+    mult:   { icon: "⚡", name: "BOOST",  max: 10, cost: l => Math.floor(50 * Math.pow(2, l)),   desc: l => `score ×${(1 + 0.25 * l).toFixed(2)}` },
+    shield: { icon: "🛡", name: "SHIELD", max: 3,  cost: l => Math.floor(120 * Math.pow(3, l)),  desc: l => `${l} hit${l === 1 ? "" : "s"} blocked` },
+    drone:  { icon: "🛰", name: "DRONE",  max: 8,  cost: l => Math.floor(80 * Math.pow(2.5, l)), desc: l => `+${l * DRONE_RATE}★/min` }
+  };
+  const multFactor = () => 1 + 0.25 * save.mult;
+
+  // ---------- Save / persistence ----------
+  let save = { best: 0, dust: 0, mult: 0, shield: 0, drone: 0, muted: false, last: Date.now() };
+  let offlineEarned = 0, offlineToast = 0;
+  try {
+    const raw = localStorage.getItem("orbitdash_save");
+    if (raw) save = Object.assign(save, JSON.parse(raw));
+    else {
+      // migrate old best score if present
+      const oldBest = parseInt(localStorage.getItem("orbitdash_best") || "0", 10);
+      if (oldBest) save.best = oldBest;
+    }
+  } catch (e) {}
+  // offline drone earnings
+  if (save.drone > 0 && save.last) {
+    const mins = Math.min(Math.max(0, (Date.now() - save.last) / 60000), OFFLINE_CAP_MIN);
+    offlineEarned = Math.floor(mins * DRONE_RATE * save.drone);
+    if (offlineEarned > 0) { save.dust += offlineEarned; offlineToast = 6; }
+  }
+  function persist() {
+    save.last = Date.now();
+    try { localStorage.setItem("orbitdash_save", JSON.stringify(Object.assign({}, save, { dust: Math.floor(save.dust) }))); } catch (e) {}
+  }
+  persist();
+  document.addEventListener("visibilitychange", () => { if (document.hidden) persist(); });
+  setInterval(persist, 5000);
+
+  // ---------- Sound (WebAudio, no assets) ----------
+  const AC = window.AudioContext || window.webkitAudioContext;
+  let audio = null;
+  function ensureAudio() {
+    if (!AC) return;
+    if (!audio) {
+      try { audio = new AC(); } catch (e) { return; }
+    }
+    if (audio.state === "suspended") audio.resume();
+  }
+  function tone(freq, dur, type, vol, slideTo) {
+    if (!audio || save.muted) return;
+    const t = audio.currentTime;
+    const o = audio.createOscillator();
+    const g = audio.createGain();
+    o.type = type || "sine";
+    o.frequency.setValueAtTime(freq, t);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t + dur);
+    g.gain.setValueAtTime(vol || 0.15, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g).connect(audio.destination);
+    o.start(t);
+    o.stop(t + dur + 0.02);
+  }
+  function noiseBurst(dur, vol, filterFreq) {
+    if (!audio || save.muted) return;
+    const t = audio.currentTime;
+    const len = Math.floor(audio.sampleRate * dur);
+    const buf = audio.createBuffer(1, len, audio.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len);
+    const src = audio.createBufferSource();
+    src.buffer = buf;
+    const f = audio.createBiquadFilter();
+    f.type = "lowpass";
+    f.frequency.setValueAtTime(filterFreq || 900, t);
+    f.frequency.exponentialRampToValueAtTime(120, t + dur);
+    const g = audio.createGain();
+    g.gain.setValueAtTime(vol || 0.3, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    src.connect(f).connect(g).connect(audio.destination);
+    src.start(t);
+  }
+  const sfx = {
+    switch() { tone(300, 0.12, "triangle", 0.12, 620); },
+    near()   { tone(880, 0.08, "sine", 0.1); tone(1320, 0.12, "sine", 0.08); },
+    start()  { tone(440, 0.1, "triangle", 0.12, 880); },
+    shield() { tone(200, 0.25, "sawtooth", 0.15, 90); noiseBurst(0.15, 0.15, 1400); },
+    death()  { noiseBurst(0.5, 0.35, 700); tone(160, 0.5, "sawtooth", 0.18, 40); },
+    best()   { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => tone(f, 0.18, "triangle", 0.14), i * 90)); },
+    buy()    { tone(700, 0.07, "square", 0.08); setTimeout(() => tone(1050, 0.12, "square", 0.08), 70); },
+    deny()   { tone(180, 0.15, "square", 0.08, 120); }
+  };
 
   // ---------- State ----------
   const ST_MENU = 0, ST_PLAY = 1, ST_DEAD = 2;
   let state = ST_MENU;
 
   let ship, asteroids, particles, stars, popups;
-  let score, best, speed, spawnTimer, spawnInterval, elapsed, shake, flash, deathInfo;
-
-  try { best = parseInt(localStorage.getItem("orbitdash_best") || "0", 10) || 0; }
-  catch (e) { best = 0; }
+  let score, speed, spawnTimer, spawnInterval, elapsed, shake, flash, deathInfo;
+  let shieldLeft = 0, invuln = 0, runEarned = 0;
+  let uiRects = {};   // hit regions rebuilt each frame
 
   function makeStars() {
     stars = [];
@@ -96,30 +185,71 @@
     shake = 0;
     flash = 0;
     deathInfo = null;
+    shieldLeft = save.shield;
+    invuln = 0;
+    runEarned = 0;
   }
   reset();
 
   // ---------- Input ----------
-  function tap() {
+  function inRect(x, y, r) { return r && x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function handleTap(x, y) {
+    ensureAudio();
+    // mute button works in every state
+    if (x != null && inRect(x, y, uiRects.mute)) {
+      save.muted = !save.muted;
+      persist();
+      if (!save.muted) tone(660, 0.08, "sine", 0.1);
+      return;
+    }
+    // shop cards on menu + game-over screens
+    if (state !== ST_PLAY && x != null) {
+      for (const key of Object.keys(UPGRADES)) {
+        if (inRect(x, y, uiRects[key])) { tryBuy(key); return; }
+      }
+    }
     if (state === ST_MENU) {
       reset();
       state = ST_PLAY;
+      sfx.start();
       return;
     }
     if (state === ST_PLAY) {
       ship.ring = (ship.ring + 1) % RINGS;
+      sfx.switch();
       burst(shipX(), shipY(), 6, "#7df9ff", 90);
       return;
     }
     if (state === ST_DEAD && deathInfo && performance.now() - deathInfo.t > 600) {
       reset();
       state = ST_PLAY;
+      sfx.start();
     }
   }
-  window.addEventListener("pointerdown", e => { e.preventDefault(); tap(); }, { passive: false });
+  window.addEventListener("pointerdown", e => { e.preventDefault(); handleTap(e.clientX, e.clientY); }, { passive: false });
   window.addEventListener("keydown", e => {
-    if (e.code === "Space" || e.code === "ArrowUp" || e.code === "Enter") { e.preventDefault(); tap(); }
+    if (e.code === "Space" || e.code === "ArrowUp" || e.code === "Enter") { e.preventDefault(); handleTap(null, null); }
+    if (e.code === "KeyM") { save.muted = !save.muted; persist(); }
   });
+
+  function tryBuy(key) {
+    const u = UPGRADES[key];
+    const lvl = save[key];
+    if (lvl >= u.max) { sfx.deny(); return; }
+    const cost = u.cost(lvl);
+    if (Math.floor(save.dust) >= cost) {
+      save.dust -= cost;
+      save[key]++;
+      persist();
+      sfx.buy();
+      const r = uiRects[key];
+      if (r) burst(r.x + r.w / 2, r.y, 14, "#ffd166", 130);
+    } else {
+      sfx.deny();
+      flash = Math.max(flash, 0.1);
+    }
+  }
 
   // ---------- Helpers ----------
   const shipX = () => CX + Math.cos(ship.a) * ship.r;
@@ -150,7 +280,6 @@
   }
 
   function spawnAsteroid() {
-    // Pick a ring, spawn away from the ship's current angle
     const ring = Math.floor(Math.random() * RINGS);
     let a;
     let tries = 0;
@@ -158,9 +287,8 @@
       a = Math.random() * Math.PI * 2;
       tries++;
     } while (ring === ship.ring && Math.abs(angDiff(a, ship.a)) < 1.1 && tries < 12);
-    // Orbit against the ship or slowly with it
     const dir = Math.random() < 0.65 ? -1 : 1;
-    const sp = (0.25 + Math.random() * 0.5) * dir;
+    const sp = (0.3 + Math.random() * 0.55) * dir;
     asteroids.push({
       ring, a, sp,
       r: AST_R() * (0.8 + Math.random() * 0.5),
@@ -168,25 +296,25 @@
       rotSp: (Math.random() - 0.5) * 3,
       verts: makeAsteroidShape(),
       scored: false,
-      born: 0   // fade/grow in, harmless briefly
+      born: 0
     });
   }
 
   function makeAsteroidShape() {
     const v = [];
     const n = 8 + Math.floor(Math.random() * 3);
-    for (let i = 0; i < n; i++) {
-      v.push(0.7 + Math.random() * 0.35);
-    }
+    for (let i = 0; i < n; i++) v.push(0.7 + Math.random() * 0.35);
     return v;
   }
 
   // ---------- Update ----------
   function update(dt) {
-    // stars twinkle always
     for (const s of stars) s.tw += s.sp * dt;
 
-    // particles always
+    // passive drone income (real-time, all states)
+    if (save.drone > 0) save.dust += (DRONE_RATE * save.drone / 60) * dt;
+    offlineToast = Math.max(0, offlineToast - dt);
+
     for (let i = particles.length - 1; i >= 0; i--) {
       const p = particles[i];
       p.x += p.vx * dt; p.y += p.vy * dt;
@@ -202,18 +330,17 @@
     }
     shake = Math.max(0, shake - dt * 3);
     flash = Math.max(0, flash - dt * 2.5);
+    invuln = Math.max(0, invuln - dt);
 
     if (state !== ST_PLAY) {
-      // menu: idle drift of demo asteroids
       for (const ast of asteroids) { ast.a += ast.sp * dt; ast.rot += ast.rotSp * dt; ast.born = Math.min(1, ast.born + dt * 2); }
       return;
     }
 
     elapsed += dt;
     speed = Math.min(MAX_SPEED, BASE_SPEED + elapsed * SPEED_RAMP);
-    spawnInterval = Math.max(SPAWN_MIN, SPAWN_START - elapsed * 0.02);
+    spawnInterval = Math.max(SPAWN_MIN, SPAWN_START - elapsed * 0.024);
 
-    // ship
     ship.a += speed * dt;
     const target = ringRadius(ship.ring);
     ship.r += (target - ship.r) * Math.min(1, RING_SNAP * dt);
@@ -221,18 +348,16 @@
     if (ship.trail.length > 26) ship.trail.shift();
     for (const t of ship.trail) t.life -= dt * 2.2;
 
-    // score: passive time score
     const prevScore = Math.floor(score);
-    score += dt * 10;
+    score += dt * 10 * multFactor();
     if (Math.floor(score / 100) > Math.floor(prevScore / 100)) flash = 0.25;
 
-    // asteroids
     spawnTimer -= dt;
     if (spawnTimer <= 0) {
       spawnAsteroid();
       spawnTimer = spawnInterval;
-      // occasionally double-spawn later on
-      if (elapsed > 25 && Math.random() < 0.35) spawnAsteroid();
+      if (elapsed > 15 && Math.random() < 0.4) spawnAsteroid();
+      if (elapsed > 45 && Math.random() < 0.25) spawnAsteroid();
     }
 
     const sx = shipX(), sy = shipY();
@@ -246,38 +371,52 @@
       const ax = CX + Math.cos(ast.a) * ar;
       const ay = CY + Math.sin(ast.a) * ar;
 
-      // cull very old asteroids to keep the field fair (cap count)
-      if (asteroids.length > 26 && i === 0) { asteroids.splice(i, 1); continue; }
+      if (asteroids.length > 30 && i === 0) { asteroids.splice(i, 1); continue; }
 
       const dx = ax - sx, dy = ay - sy;
       const dist = Math.hypot(dx, dy);
       const hitDist = ast.r + SHIP_R() * 0.9;
 
-      if (ast.born >= 1 && dist < hitDist) {
+      if (ast.born >= 1 && dist < hitDist && invuln <= 0) {
+        if (shieldLeft > 0) {
+          // shield absorbs the hit and vaporizes the asteroid
+          shieldLeft--;
+          invuln = 1;
+          asteroids.splice(i, 1);
+          shake = 0.45;
+          sfx.shield();
+          burst(ax, ay, 20, "#4dd2ff", 180);
+          popup(sx, sy - 20, "SHIELD!", "#4dd2ff");
+          continue;
+        }
         // death
         state = ST_DEAD;
         deathInfo = { t: performance.now() };
         shake = 1;
         flash = 0.8;
+        sfx.death();
         burst(sx, sy, 40, "#ff5470", 260);
         burst(sx, sy, 25, "#ffd166", 200);
         const fs = Math.floor(score);
-        if (fs > best) {
-          best = fs;
-          try { localStorage.setItem("orbitdash_best", String(best)); } catch (e) {}
+        runEarned = Math.floor(fs / 10);
+        save.dust += runEarned;
+        if (fs > save.best) {
+          save.best = fs;
+          setTimeout(() => sfx.best(), 500);
         }
+        persist();
         return;
       }
 
-      // near-miss bonus: same ring, passed close by
       if (!ast.scored && ast.ring === ship.ring && ast.born >= 1 && dist < hitDist * 3 && dist > hitDist) {
-        // only count when moving apart after a close approach
         ast.nearMiss = true;
       }
       if (ast.nearMiss && !ast.scored && dist > hitDist * 3.2) {
         ast.scored = true;
-        score += 25;
-        popup(ax, ay, "+25", "#7df9ff");
+        const pts = Math.floor(25 * multFactor());
+        score += pts;
+        sfx.near();
+        popup(ax, ay, "+" + pts, "#7df9ff");
         burst(ax, ay, 5, "#7df9ff", 70);
       }
     }
@@ -294,20 +433,68 @@
     ctx.closePath();
   }
 
+  function drawDust(x, y, size, align) {
+    ctx.textAlign = align || "left";
+    ctx.fillStyle = "#ffd166";
+    ctx.font = `700 ${Math.round(size)}px -apple-system, sans-serif`;
+    ctx.fillText("★ " + Math.floor(save.dust), x, y);
+  }
+
+  function drawShopCard(key, x, y, w, h) {
+    const u = UPGRADES[key];
+    const lvl = save[key];
+    const maxed = lvl >= u.max;
+    const cost = maxed ? 0 : u.cost(lvl);
+    const afford = !maxed && Math.floor(save.dust) >= cost;
+
+    uiRects[key] = { x, y, w, h };
+    roundRect(x, y, w, h, 10);
+    ctx.fillStyle = afford ? "rgba(35,40,90,0.85)" : "rgba(22,25,55,0.8)";
+    ctx.fill();
+    ctx.strokeStyle = afford ? "rgba(255,209,102,0.8)" : "rgba(125,249,255,0.18)";
+    ctx.lineWidth = afford ? 2 : 1;
+    ctx.stroke();
+
+    const cxm = x + w / 2;
+    ctx.textAlign = "center";
+    ctx.font = `${Math.round(h * 0.26)}px -apple-system, sans-serif`;
+    ctx.fillStyle = "#fff";
+    ctx.fillText(u.icon, cxm, y + h * 0.30);
+    ctx.font = `800 ${Math.round(h * 0.14)}px -apple-system, sans-serif`;
+    ctx.fillStyle = "#fff";
+    ctx.fillText(`${u.name} ${lvl > 0 ? "Lv" + lvl : ""}`, cxm, y + h * 0.50);
+    ctx.font = `600 ${Math.round(h * 0.115)}px -apple-system, sans-serif`;
+    ctx.fillStyle = "rgba(255,255,255,0.6)";
+    ctx.fillText(maxed ? u.desc(lvl) : u.desc(lvl + 1), cxm, y + h * 0.66);
+    ctx.font = `800 ${Math.round(h * 0.14)}px -apple-system, sans-serif`;
+    ctx.fillStyle = maxed ? "#7df9ff" : (afford ? "#ffd166" : "rgba(255,209,102,0.4)");
+    ctx.fillText(maxed ? "MAX" : "★ " + cost, cxm, y + h * 0.86);
+  }
+
+  function drawShop() {
+    const gap = UNIT * 0.02;
+    const cw = Math.min((W - gap * 4) / 3, UNIT * 0.30);
+    const chh = cw * 0.78;
+    const total = cw * 3 + gap * 2;
+    const x0 = CX - total / 2;
+    const y = H - chh - Math.max(16, H * 0.03);
+    const keys = ["mult", "shield", "drone"];
+    for (let i = 0; i < 3; i++) drawShopCard(keys[i], x0 + i * (cw + gap), y, cw, chh);
+  }
+
   function draw() {
+    uiRects = {};
     ctx.save();
     if (shake > 0) {
       ctx.translate((Math.random() - 0.5) * shake * 14, (Math.random() - 0.5) * shake * 14);
     }
 
-    // background
     const g = ctx.createRadialGradient(CX, CY, 0, CX, CY, UNIT * 0.9);
     g.addColorStop(0, "#101334");
     g.addColorStop(1, "#060714");
     ctx.fillStyle = g;
     ctx.fillRect(-20, -20, W + 40, H + 40);
 
-    // stars
     for (const s of stars) {
       ctx.globalAlpha = 0.35 + 0.35 * Math.sin(s.tw);
       ctx.fillStyle = "#cdd6ff";
@@ -317,7 +504,6 @@
     }
     ctx.globalAlpha = 1;
 
-    // rings
     for (let i = 0; i < RINGS; i++) {
       ctx.beginPath();
       ctx.arc(CX, CY, ringRadius(i), 0, Math.PI * 2);
@@ -342,6 +528,27 @@
     ctx.beginPath();
     ctx.arc(CX, CY, pr + 5, 0, Math.PI * 2);
     ctx.stroke();
+
+    // stardust drones orbiting close to the planet
+    if (save.drone > 0) {
+      const n = Math.min(save.drone, 4);
+      for (let i = 0; i < n; i++) {
+        const a = performance.now() / 900 + (i / n) * Math.PI * 2;
+        const dr = pr * 1.55;
+        const dx = CX + Math.cos(a) * dr;
+        const dy = CY + Math.sin(a) * dr;
+        ctx.fillStyle = "#ffd166";
+        ctx.beginPath();
+        ctx.arc(dx, dy, UNIT * 0.007, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = "rgba(255,209,102,0.4)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(dx - UNIT * 0.012, dy);
+        ctx.lineTo(dx + UNIT * 0.012, dy);
+        ctx.stroke();
+      }
+    }
 
     // asteroids
     for (const ast of asteroids) {
@@ -392,10 +599,21 @@
       const heading = state === ST_PLAY ? ship.a + Math.PI / 2 : performance.now() / 700 + Math.PI / 2;
       ctx.save();
       ctx.translate(sx, sy);
+      // shield bubble
+      if (state === ST_PLAY && shieldLeft > 0) {
+        ctx.globalAlpha = invuln > 0 ? 0.9 : 0.45 + 0.2 * Math.sin(performance.now() / 200);
+        ctx.strokeStyle = "#4dd2ff";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(0, 0, SHIP_R() * 2.4, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
       ctx.rotate(heading);
       const r = SHIP_R();
       ctx.shadowColor = "#7df9ff";
       ctx.shadowBlur = 14;
+      if (state === ST_PLAY && invuln > 0 && shieldLeft === 0) ctx.globalAlpha = 0.5 + 0.5 * Math.sin(performance.now() / 60);
       ctx.beginPath();
       ctx.moveTo(0, -r * 1.6);
       ctx.lineTo(r * 1.1, r * 1.2);
@@ -405,6 +623,7 @@
       ctx.fillStyle = "#7df9ff";
       ctx.fill();
       ctx.restore();
+      ctx.globalAlpha = 1;
     }
 
     // particles
@@ -427,7 +646,18 @@
     }
     ctx.globalAlpha = 1;
 
-    // HUD
+    // ---- HUD (always) ----
+    const pad = Math.max(14, UNIT * 0.03);
+    drawDust(pad, pad + UNIT * 0.02, UNIT * 0.030);
+    // mute button
+    const mb = { w: UNIT * 0.075, h: UNIT * 0.075 };
+    uiRects.mute = { x: W - pad - mb.w, y: pad - mb.h * 0.25, w: mb.w, h: mb.h };
+    ctx.textAlign = "right";
+    ctx.font = `${Math.round(UNIT * 0.040)}px -apple-system, sans-serif`;
+    ctx.globalAlpha = 0.85;
+    ctx.fillText(save.muted ? "🔇" : "🔊", W - pad, pad + UNIT * 0.025);
+    ctx.globalAlpha = 1;
+
     if (state === ST_PLAY) {
       ctx.fillStyle = "#ffffff";
       ctx.font = `bold ${Math.round(UNIT * 0.055)}px -apple-system, sans-serif`;
@@ -435,7 +665,10 @@
       ctx.fillText(String(Math.floor(score)), CX, UNIT * 0.09);
       ctx.fillStyle = "rgba(255,255,255,0.45)";
       ctx.font = `600 ${Math.round(UNIT * 0.024)}px -apple-system, sans-serif`;
-      ctx.fillText(`BEST ${Math.max(best, Math.floor(score))}`, CX, UNIT * 0.125);
+      const bits = [`BEST ${Math.max(save.best, Math.floor(score))}`];
+      if (save.mult > 0) bits.push(`×${multFactor().toFixed(2)}`);
+      if (shieldLeft > 0) bits.push(`🛡${shieldLeft}`);
+      ctx.fillText(bits.join("   "), CX, UNIT * 0.125);
     }
 
     // menu
@@ -447,44 +680,65 @@
       ctx.fillStyle = "#7df9ff";
       ctx.font = `600 ${Math.round(UNIT * 0.028)}px -apple-system, sans-serif`;
       ctx.fillText("tap to switch rings · dodge the asteroids", CX, CY - UNIT * 0.245);
-      if (best > 0) {
+      if (save.best > 0) {
         ctx.fillStyle = "rgba(255,255,255,0.6)";
-        ctx.fillText(`BEST ${best}`, CX, CY + UNIT * 0.27);
+        ctx.fillText(`BEST ${save.best}`, CX, CY + UNIT * 0.235);
       }
       const pulse = 0.6 + 0.4 * Math.sin(performance.now() / 350);
       ctx.globalAlpha = pulse;
       ctx.fillStyle = "#ffffff";
       ctx.font = `700 ${Math.round(UNIT * 0.036)}px -apple-system, sans-serif`;
-      ctx.fillText("TAP TO PLAY", CX, CY + UNIT * 0.34);
+      ctx.fillText("TAP TO PLAY", CX, CY + UNIT * 0.30);
       ctx.globalAlpha = 1;
+      drawShop();
+
+      if (offlineToast > 0 && offlineEarned > 0) {
+        ctx.globalAlpha = Math.min(1, offlineToast);
+        roundRect(CX - UNIT * 0.28, UNIT * 0.14, UNIT * 0.56, UNIT * 0.085, 10);
+        ctx.fillStyle = "rgba(255,209,102,0.12)";
+        ctx.fill();
+        ctx.strokeStyle = "rgba(255,209,102,0.7)";
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        ctx.fillStyle = "#ffd166";
+        ctx.textAlign = "center";
+        ctx.font = `700 ${Math.round(UNIT * 0.026)}px -apple-system, sans-serif`;
+        ctx.fillText(`while you were away: +${offlineEarned} ★`, CX, UNIT * 0.14 + UNIT * 0.053);
+        ctx.globalAlpha = 1;
+      }
     }
 
     // game over
     if (state === ST_DEAD) {
       ctx.fillStyle = "rgba(6,7,20,0.55)";
       ctx.fillRect(-20, -20, W + 40, H + 40);
+      // redraw HUD dust on top of the dim layer
+      drawDust(pad, pad + UNIT * 0.02, UNIT * 0.030);
       ctx.textAlign = "center";
       ctx.fillStyle = "#ff5470";
       ctx.font = `800 ${Math.round(UNIT * 0.06)}px -apple-system, sans-serif`;
-      ctx.fillText("GAME OVER", CX, CY - UNIT * 0.10);
+      ctx.fillText("GAME OVER", CX, CY - UNIT * 0.16);
       ctx.fillStyle = "#ffffff";
       ctx.font = `bold ${Math.round(UNIT * 0.075)}px -apple-system, sans-serif`;
-      ctx.fillText(String(Math.floor(score)), CX, CY);
-      const isBest = Math.floor(score) >= best && best > 0;
+      ctx.fillText(String(Math.floor(score)), CX, CY - UNIT * 0.06);
+      const isBest = Math.floor(score) >= save.best && save.best > 0;
       ctx.fillStyle = isBest ? "#ffd166" : "rgba(255,255,255,0.6)";
       ctx.font = `600 ${Math.round(UNIT * 0.028)}px -apple-system, sans-serif`;
-      ctx.fillText(isBest ? "★ NEW BEST ★" : `BEST ${best}`, CX, CY + UNIT * 0.05);
+      ctx.fillText(isBest ? "★ NEW BEST ★" : `BEST ${save.best}`, CX, CY - UNIT * 0.01);
+      ctx.fillStyle = "#ffd166";
+      ctx.font = `700 ${Math.round(UNIT * 0.032)}px -apple-system, sans-serif`;
+      ctx.fillText(`+${runEarned} ★ earned`, CX, CY + UNIT * 0.055);
       if (performance.now() - deathInfo.t > 600) {
         const pulse = 0.6 + 0.4 * Math.sin(performance.now() / 350);
         ctx.globalAlpha = pulse;
         ctx.fillStyle = "#ffffff";
         ctx.font = `700 ${Math.round(UNIT * 0.032)}px -apple-system, sans-serif`;
-        ctx.fillText("TAP TO RETRY", CX, CY + UNIT * 0.14);
+        ctx.fillText("TAP TO RETRY", CX, CY + UNIT * 0.125);
         ctx.globalAlpha = 1;
       }
+      drawShop();
     }
 
-    // flash
     if (flash > 0) {
       ctx.globalAlpha = flash * 0.25;
       ctx.fillStyle = "#ffffff";
