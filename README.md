@@ -14,6 +14,14 @@ A one-tap idle arcade game. Your ship orbits a planet — tap to leap between or
 - **Controls:** tap / click / spacebar
 - **Tech:** vanilla JavaScript + Canvas, single self-contained HTML file, zero dependencies
 
+### Astro Stack
+
+A one-tap idle stacking game. Drop sliding blocks to build the tallest tower — overhangs get sliced off, perfect drops chain combos for bonus crystals. Spend crystals on upgrades: wider bases, slower blocks, richer payouts, and miners that keep earning even while you're away (offline earnings included).
+
+- **Play:** https://zaincb.github.io/youtube-playables/astro-stack/
+- **Controls:** tap / click / spacebar
+- **Tech:** vanilla JavaScript + Canvas, single self-contained HTML file, zero dependencies
+
 ## Running locally
 
 Open any game's `index.html` in a browser, or serve the repo root:
