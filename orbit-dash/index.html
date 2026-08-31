@@ -63,12 +63,13 @@
   const UPGRADES = {
     mult:   { icon: "⚡", name: "BOOST",  max: 10, cost: l => Math.floor(50 * Math.pow(2, l)),   desc: l => `score ×${(1 + 0.25 * l).toFixed(2)}` },
     shield: { icon: "🛡", name: "SHIELD", max: 3,  cost: l => Math.floor(120 * Math.pow(3, l)),  desc: l => `${l} hit${l === 1 ? "" : "s"} blocked` },
-    drone:  { icon: "🛰", name: "DRONE",  max: 8,  cost: l => Math.floor(80 * Math.pow(2.5, l)), desc: l => `+${l * DRONE_RATE}★/min` }
+    drone:  { icon: "🛰", name: "DRONE",  max: 8,  cost: l => Math.floor(80 * Math.pow(2.5, l)), desc: l => `+${l * DRONE_RATE}★/min` },
+    auto:   { icon: "🤖", name: "AUTO",   max: 6,  cost: l => Math.floor(150 * Math.pow(2.2, l)), desc: l => `${l * 5}s autopilot` }
   };
   const multFactor = () => 1 + 0.25 * save.mult;
 
   // ---------- Save / persistence ----------
-  let save = { best: 0, dust: 0, mult: 0, shield: 0, drone: 0, muted: false, last: Date.now() };
+  let save = { best: 0, dust: 0, mult: 0, shield: 0, drone: 0, auto: 0, muted: false, last: Date.now() };
   let offlineEarned = 0, offlineToast = 0;
   try {
     const raw = localStorage.getItem("orbitdash_save");
@@ -154,6 +155,7 @@
   let ship, asteroids, particles, stars, popups;
   let score, speed, spawnTimer, spawnInterval, elapsed, shake, flash, deathInfo;
   let shieldLeft = 0, invuln = 0, runEarned = 0;
+  let autoLeft = 0, autoCooldown = 0;
   let uiRects = {};   // hit regions rebuilt each frame
 
   function makeStars() {
@@ -188,6 +190,8 @@
     shieldLeft = save.shield;
     invuln = 0;
     runEarned = 0;
+    autoLeft = save.auto * 5;
+    autoCooldown = 0;
   }
   reset();
 
@@ -307,6 +311,47 @@
     return v;
   }
 
+  // ---------- Autopilot ----------
+  // Earliest time (s) within the look-ahead horizon at which an asteroid on
+  // ring r would overlap the ship's angle. 2 = no threat found.
+  function ringDangerTime(r) {
+    let t = 2;
+    const rr = ringRadius(r);
+    const collAng = ((AST_R() + SHIP_R() * 0.9) / rr) * 1.7;   // padded angular width
+    for (const ast of asteroids) {
+      if (ast.ring !== r) continue;
+      for (let tt = 0; tt <= 0.9; tt += 0.06) {
+        const sa = ship.a + speed * tt;
+        const aa = ast.a + ast.sp * tt;
+        if (Math.abs(angDiff(aa, sa)) < collAng) {
+          if (tt < t) t = tt;
+          break;
+        }
+      }
+    }
+    return t;
+  }
+
+  function autoSwitch() {
+    ship.ring = (ship.ring + 1) % RINGS;
+    sfx.switch();
+    burst(shipX(), shipY(), 6, "#ffd166", 90);
+  }
+
+  function autopilot(dt) {
+    autoCooldown -= dt;
+    if (autoCooldown > 0) return;
+    const dCur = ringDangerTime(ship.ring);
+    if (dCur < 0.55) {
+      const dNext = ringDangerTime((ship.ring + 1) % RINGS);
+      const dNext2 = ringDangerTime((ship.ring + 2) % RINGS);
+      // hop forward if the next ring buys time, or as the first leg of a
+      // double hop toward the ring after it; the cooldown lets hops chain
+      if (dNext > dCur || dNext2 > dCur) autoSwitch();
+      autoCooldown = 0.18;
+    }
+  }
+
   // ---------- Update ----------
   function update(dt) {
     for (const s of stars) s.tw += s.sp * dt;
@@ -342,6 +387,15 @@
     spawnInterval = Math.max(SPAWN_MIN, SPAWN_START - elapsed * 0.024);
 
     ship.a += speed * dt;
+    if (autoLeft > 0) {
+      autoLeft -= dt;
+      if (autoLeft <= 0) {
+        popup(shipX(), shipY() - 30, "AUTO OFF", "#ffd166");
+        tone(500, 0.2, "triangle", 0.12, 250);
+      } else {
+        autopilot(dt);
+      }
+    }
     const target = ringRadius(ship.ring);
     ship.r += (target - ship.r) * Math.min(1, RING_SNAP * dt);
     ship.trail.push({ x: shipX(), y: shipY(), life: 1 });
@@ -471,15 +525,22 @@
     ctx.fillText(maxed ? "MAX" : "★ " + cost, cxm, y + h * 0.86);
   }
 
+  function shopTop() {
+    const gap = UNIT * 0.016;
+    const cw = Math.min((W - gap * 5) / 4, UNIT * 0.26);
+    return H - cw * 0.88 - Math.max(16, H * 0.03);
+  }
+
   function drawShop() {
-    const gap = UNIT * 0.02;
-    const cw = Math.min((W - gap * 4) / 3, UNIT * 0.30);
-    const chh = cw * 0.78;
-    const total = cw * 3 + gap * 2;
+    const gap = UNIT * 0.016;
+    const keys = ["mult", "shield", "drone", "auto"];
+    const n = keys.length;
+    const cw = Math.min((W - gap * (n + 1)) / n, UNIT * 0.26);
+    const chh = cw * 0.88;
+    const total = cw * n + gap * (n - 1);
     const x0 = CX - total / 2;
-    const y = H - chh - Math.max(16, H * 0.03);
-    const keys = ["mult", "shield", "drone"];
-    for (let i = 0; i < 3; i++) drawShopCard(keys[i], x0 + i * (cw + gap), y, cw, chh);
+    const y = shopTop();
+    for (let i = 0; i < n; i++) drawShopCard(keys[i], x0 + i * (cw + gap), y, cw, chh);
   }
 
   function draw() {
@@ -599,6 +660,18 @@
       const heading = state === ST_PLAY ? ship.a + Math.PI / 2 : performance.now() / 700 + Math.PI / 2;
       ctx.save();
       ctx.translate(sx, sy);
+      // autopilot halo
+      if (state === ST_PLAY && autoLeft > 0) {
+        ctx.globalAlpha = 0.7;
+        ctx.strokeStyle = "#ffd166";
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([4, 5]);
+        ctx.beginPath();
+        ctx.arc(0, 0, SHIP_R() * 3.1, performance.now() / 400, performance.now() / 400 + Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.globalAlpha = 1;
+      }
       // shield bubble
       if (state === ST_PLAY && shieldLeft > 0) {
         ctx.globalAlpha = invuln > 0 ? 0.9 : 0.45 + 0.2 * Math.sin(performance.now() / 200);
@@ -668,6 +741,7 @@
       const bits = [`BEST ${Math.max(save.best, Math.floor(score))}`];
       if (save.mult > 0) bits.push(`×${multFactor().toFixed(2)}`);
       if (shieldLeft > 0) bits.push(`🛡${shieldLeft}`);
+      if (autoLeft > 0) bits.push(`🤖${Math.ceil(autoLeft)}s`);
       ctx.fillText(bits.join("   "), CX, UNIT * 0.125);
     }
 
@@ -680,15 +754,16 @@
       ctx.fillStyle = "#7df9ff";
       ctx.font = `600 ${Math.round(UNIT * 0.028)}px -apple-system, sans-serif`;
       ctx.fillText("tap to switch rings · dodge the asteroids", CX, CY - UNIT * 0.245);
+      const tapY = Math.min(CY + UNIT * 0.30, shopTop() - UNIT * 0.03);
       if (save.best > 0) {
         ctx.fillStyle = "rgba(255,255,255,0.6)";
-        ctx.fillText(`BEST ${save.best}`, CX, CY + UNIT * 0.235);
+        ctx.fillText(`BEST ${save.best}`, CX, tapY - UNIT * 0.065);
       }
       const pulse = 0.6 + 0.4 * Math.sin(performance.now() / 350);
       ctx.globalAlpha = pulse;
       ctx.fillStyle = "#ffffff";
       ctx.font = `700 ${Math.round(UNIT * 0.036)}px -apple-system, sans-serif`;
-      ctx.fillText("TAP TO PLAY", CX, CY + UNIT * 0.30);
+      ctx.fillText("TAP TO PLAY", CX, tapY);
       ctx.globalAlpha = 1;
       drawShop();
 
