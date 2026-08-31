@@ -824,6 +824,13 @@
     ctx.restore();
   }
 
+  // read-only state snapshot for automated testing
+  window.__orbitDebug = () => ({
+    state, score: Math.floor(score), elapsed: Math.round(elapsed * 10) / 10,
+    autoLeft: Math.round(autoLeft * 10) / 10, shieldLeft,
+    asteroids: asteroids.length, dust: Math.floor(save.dust)
+  });
+
   // seed a few demo asteroids for the menu backdrop
   function seedMenu() {
     asteroids = [];
